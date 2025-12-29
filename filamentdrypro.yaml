@@ -1,0 +1,935 @@
+# ============================================================================
+# Filament Trockenschrank (KC868-A16 / ESP32) – ESPHome
+#
+# Home Assistant Entities (automatisch via ESPHome-API)
+# --------------------------------------------------------------------------
+# SCHALTER (switch.*) (ESPHome → HA Entity-ID i.d.R. immer: <node>_<name>):
+#   switch.<devicename>_peltier_enable : Master Enable für Entfeuchtung/State-Machine
+#   switch.<devicename>_fan_cold       : Manuell Kaltseitenlüfter (Override)
+#   switch.<devicename>_fan_hot        : Manuell Heißseitenlüfter (Override)
+#   switch.<devicename>_pump           : Manuell Pumpe (Override)
+#   switch.<devicename>_fan_aux        : Manuell Zusatzlüfter (Override)
+#   switch.<devicename>_light          : Manuell Innenlicht
+#   switch.<devicename>_light_auto     : Auto-Licht per Radar/Tür (Hold-Timer)
+#
+# PARAMETER (number.*) [entity_category: config]:
+#   number.<devicename>_rh_start       : Start Entfeuchtung [% rF]
+#   number.<devicename>_rh_stop        : Stop  Entfeuchtung [% rF]
+#   number.<devicename>_t_cold_soll    : Soll Kaltplatte [°C]
+#   number.<devicename>_t_defrost_end  : Ende DEFROST wenn T_cold > Wert [°C]
+#   number.<devicename>_t_cool_max     : Max. COOLING Dauer [min] -> dann DEFROST
+#   number.<devicename>_t_pump         : Pumpdauer im PUMP-State [s]
+#   number.<devicename>_t_hot_max      : Übertemp Heißseite -> Fault [°C]
+#   number.<devicename>_t_light_hold   : Licht-Haltezeit nach Radar [min]
+#   number.<devicename>_fan_cold_pwm   : Basis PWM Kaltlüfter [%] (hier als Level genutzt)
+#   number.<devicename>_delta_t_ice    : Eisheuristik ΔT [K]
+#   number.<devicename>_t_ice_min      : Eisheuristik Mindestzeit [min]
+#   (optional) diverse Radar/LD2412 Parameter
+#
+# SENSOREN (sensor.*):
+#   sensor.<devicename>_rh             : Innen rF (SHT3x)
+#   sensor.<devicename>_temp_sht       : Innen Temp (SHT3x)
+#   sensor.<devicename>_absolute_humidity : Absolute Feuchte (aus Temp+RH)
+#   sensor.<devicename>_temp_cold      : DS18B20 Kaltplatte
+#   sensor.<devicename>_temp_hot       : DS18B20 Heißseite/Heatsink
+#   sensor.<devicename>_peltier_pwm    : aktuell berechneter Peltier-Duty [%]
+#   (optional) diverse Radar/LD2412 Telemetrie-Sensoren
+#
+# BINÄRE SENSOREN (binary_sensor.*):
+#   binary_sensor.<devicename>_door_open      : Tür offen (X01)
+#   binary_sensor.<devicename>_radar_presence : Radar Präsenz (LD2412)
+#   binary_sensor.<devicename>_schrank_fault  : latched fault (T_hot > max)
+#
+# BUTTONS (button.*) [entity_category: config]:
+#   button.<devicename>_force_defrost
+#   button.<devicename>_force_dry
+#   button.<devicename>_reset_fault
+#   (optional) diverse Radar/LD2412 Buttons
+#
+# Anschluss-/Verdrahtungsübersicht (KC868-A16, REV:1.6)
+# --------------------------------------------------------------------------
+# I2C Bus:
+#   GPIO4 = SDA, GPIO5 = SCL -> SHT3x + PCF8574 Expander, JST Stecker beschriftet
+#
+# DS18B20 (1-Wire Bus):
+#   HT1 / GPIO32 -> alle DS18B20 parallel (T_cold, T_hot, T_add1, T_add2)
+#
+# Türkontakt:
+#   X01 (PCF8574 @0x22, Pin0) -> Reedkontakt (dry contact)
+#
+# Radar LD2412:
+#   ESP32 TX GPIO15 -> LD2412 RX -> 433 Stecker P7 Pin3 (GND | 3V3 | GPIO15 | ...)
+#   ESP32 RX GPIO33 -> LD2412 TX -> HT2 / GPIO33
+#
+# MOSFET-Ausgänge (über PCF8574 Outputs):
+#   Y09 -> Peltier-Leistungsstufe (externes MOSFET-Gate/Enable)   [PCF @0x25 Pin0]
+#   Y02 -> Lüfter Kaltseite (12V)                                  [PCF @0x24 Pin1]
+#   Y03 -> Lüfter Heißseite (12V)                                  [PCF @0x24 Pin2]
+#   Y04 -> Peristaltikpumpe (12V)                                  [PCF @0x24 Pin3]
+#   Y05 -> Innenlicht (12V LED)                                    [PCF @0x24 Pin4]
+#   Y06 -> Zusatzlüfter Schrank (12V)                              [PCF @0x24 Pin5]
+#
+# Hinweis zu device_class:
+#   - device_class gibt es sinnvoll für binary_sensor und sensor (HA-Semantik).
+#   - switch/number/button bekommen primär Icons; numbers/buttons zusätzlich entity_category: config.
+#
+# Tür-Logik:
+#   - State-Machine läuft weiter.
+#   - Bei offener Tür wird nur der Zusatzlüfter (Y06) sofort AUS geschaltet,
+#     um aktives „Rausblasen“ zu vermeiden.
+# ============================================================================
+
+substitutions:
+  devicename: filament-dryer
+  friendly_name: "Filament Trockenschrank"
+
+  # --- Annahmen bestätigt ---
+  pcf_outputs_inverted: "true"   # LOW=AN
+  door_inverted: "true"          # Türkontakt passt so
+
+  # Compile-time Optionen
+  pause_drying_on_door_open: "true"
+  door_forces_light: "true"
+
+esphome:
+  name: ${devicename}
+  friendly_name: ${friendly_name}
+  comment: "Trockenschrank: Entfeuchtung + Radar-Licht (State-Machine IDLE/COOLING/DEFROST/PUMP)"
+
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: apply_outputs
+      - lambda: |-
+          id(sm_state) = 0;  // IDLE
+          id(sm_timer_s) = 0;
+          id(ice_timer_s) = 0;
+          id(hot_fan_postrun_s) = 0;
+          id(light_hold_s) = 0;
+          id(fault_latched) = false;
+          id(force_defrost) = false;
+          id(force_dry) = false;
+          id(peltier_level) = 0.0f;
+          id(fan_cold_level) = 0.0f;
+          id(man_fan_cold) = false;
+          id(man_fan_hot) = false;
+          id(man_pump) = false;
+          id(man_fan_aux) = false;
+          id(man_light) = false;
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: ${devicename} Hotspot
+    password: !secret wifi_password
+
+captive_portal:
+
+logger:
+  level: DEBUG
+  baud_rate: 0
+
+ota:
+  password: !secret esp_password
+  platform: esphome
+
+api:
+  encryption:
+    key: !secret api_key
+
+i2c:
+  sda: GPIO4
+  scl: GPIO5
+  scan: true
+
+pcf8574:
+  - id: pcf_in_1_8
+    address: 0x22
+  - id: pcf_in_9_16
+    address: 0x21
+  - id: pcf_out_1_8
+    address: 0x24
+  - id: pcf_out_9_16
+    address: 0x25
+
+one_wire:
+  - platform: gpio
+    pin: GPIO32
+
+uart:
+  - id: uart_ld2412
+    tx_pin: GPIO15
+    rx_pin: GPIO33
+    baud_rate: 115200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+
+ld2412:
+  uart_id: uart_ld2412
+
+globals:
+  - id: sm_state
+    type: int
+    initial_value: "0"
+  - id: sm_timer_s
+    type: uint32_t
+    initial_value: "0"
+  - id: ice_timer_s
+    type: uint32_t
+    initial_value: "0"
+  - id: hot_fan_postrun_s
+    type: uint32_t
+    initial_value: "0"
+  - id: fault_latched
+    type: bool
+    initial_value: "false"
+  - id: force_defrost
+    type: bool
+    initial_value: "false"
+  - id: force_dry
+    type: bool
+    initial_value: "false"
+  - id: light_hold_s
+    type: uint32_t
+    initial_value: "0"
+  - id: peltier_level
+    type: float
+    initial_value: "0.0"
+  - id: fan_cold_level
+    type: float
+    initial_value: "0.0"
+  - id: man_fan_cold
+    type: bool
+    initial_value: "false"
+  - id: man_fan_hot
+    type: bool
+    initial_value: "false"
+  - id: man_pump
+    type: bool
+    initial_value: "false"
+  - id: man_fan_aux
+    type: bool
+    initial_value: "false"
+  - id: man_light
+    type: bool
+    initial_value: "false"
+
+output:
+  # Y09 -> Peltier (PCF 0x25, Pin0)
+  - platform: slow_pwm
+    id: out_peltier
+    pin:
+      pcf8574: pcf_out_9_16
+      number: 0
+      mode: OUTPUT
+      inverted: ${pcf_outputs_inverted}
+    period: 500ms
+
+  # Y02 -> Fan cold (PCF 0x24, Pin1) (als Level genutzt)
+  - platform: slow_pwm
+    id: out_fan_cold
+    pin:
+      pcf8574: pcf_out_1_8
+      number: 1
+      mode: OUTPUT
+      inverted: ${pcf_outputs_inverted}
+    period: 100ms
+
+switch:
+  - platform: template
+    name: "peltier_enable"
+    id: schrank_peltier_enable
+    icon: mdi:snowflake-thermometer
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    on_turn_on:
+      - script.execute: apply_outputs
+    on_turn_off:
+      - lambda: |-
+          id(force_dry) = false;
+          id(force_defrost) = false;
+          id(sm_state) = 0;
+          id(sm_timer_s) = 0;
+          id(peltier_level) = 0.0f;
+      - script.execute: apply_outputs
+
+  - platform: gpio
+    id: sw_fan_hot_phys
+    internal: true
+    pin:
+      pcf8574: pcf_out_1_8
+      number: 2           # Y03
+      mode: OUTPUT
+      inverted: ${pcf_outputs_inverted}
+
+  - platform: gpio
+    id: sw_pump_phys
+    internal: true
+    pin:
+      pcf8574: pcf_out_1_8
+      number: 3           # Y04
+      mode: OUTPUT
+      inverted: ${pcf_outputs_inverted}
+
+  - platform: gpio
+    id: sw_light_phys
+    internal: true
+    pin:
+      pcf8574: pcf_out_1_8
+      number: 4           # Y05
+      mode: OUTPUT
+      inverted: ${pcf_outputs_inverted}
+
+  - platform: gpio
+    id: sw_fan_aux_phys
+    internal: true
+    pin:
+      pcf8574: pcf_out_1_8
+      number: 5           # Y06
+      mode: OUTPUT
+      inverted: ${pcf_outputs_inverted}
+
+  - platform: template
+    name: "fan_cold"
+    icon: mdi:fan
+    optimistic: true
+    lambda: |-
+      return id(man_fan_cold);
+    turn_on_action:
+      - lambda: id(man_fan_cold) = true;
+      - script.execute: apply_outputs
+    turn_off_action:
+      - lambda: id(man_fan_cold) = false;
+      - script.execute: apply_outputs
+
+  - platform: template
+    name: "fan_hot"
+    icon: mdi:fan
+    optimistic: true
+    lambda: |-
+      return id(man_fan_hot);
+    turn_on_action:
+      - lambda: id(man_fan_hot) = true;
+      - script.execute: apply_outputs
+    turn_off_action:
+      - lambda: id(man_fan_hot) = false;
+      - script.execute: apply_outputs
+
+  - platform: template
+    name: "pump"
+    icon: mdi:pump
+    optimistic: true
+    lambda: |-
+      return id(man_pump);
+    turn_on_action:
+      - lambda: id(man_pump) = true;
+      - script.execute: apply_outputs
+    turn_off_action:
+      - lambda: id(man_pump) = false;
+      - script.execute: apply_outputs
+
+  - platform: template
+    name: "fan_aux"
+    icon: mdi:fan-plus
+    optimistic: true
+    lambda: |-
+      return id(man_fan_aux);
+    turn_on_action:
+      - lambda: id(man_fan_aux) = true;
+      - script.execute: apply_outputs
+    turn_off_action:
+      - lambda: id(man_fan_aux) = false;
+      - script.execute: apply_outputs
+
+  - platform: template
+    name: "light"
+    icon: mdi:lightbulb
+    optimistic: true
+    lambda: |-
+      return id(man_light);
+    turn_on_action:
+      - lambda: id(man_light) = true;
+      - script.execute: apply_outputs
+    turn_off_action:
+      - lambda: id(man_light) = false;
+      - script.execute: apply_outputs
+
+  - platform: template
+    name: "light_auto"
+    id: schrank_light_auto
+    icon: mdi:motion-sensor
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    turn_on_action:
+      - script.execute: apply_outputs
+    turn_off_action:
+      - lambda: |-
+          id(light_hold_s) = 0;
+      - script.execute: apply_outputs
+
+number:
+  - platform: template
+    name: "rh_start"
+    id: n_rh_start
+    icon: mdi:water-percent
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 50
+    step: 0.5
+    restore_value: true
+    optimistic: true
+    initial_value: 30
+
+  - platform: template
+    name: "rh_stop"
+    id: n_rh_stop
+    icon: mdi:water-percent
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 5
+    max_value: 50
+    step: 0.5
+    restore_value: true
+    optimistic: true
+    initial_value: 20
+
+  - platform: template
+    name: "t_cold_soll"
+    id: n_t_cold_soll
+    icon: mdi:snowflake-thermometer
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: -15
+    max_value: 10
+    step: 0.5
+    restore_value: true
+    optimistic: true
+    initial_value: -3
+
+  - platform: template
+    name: "t_defrost_end"
+    id: n_t_defrost_end
+    icon: mdi:thermometer-high
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: -5
+    max_value: 20
+    step: 0.5
+    restore_value: true
+    optimistic: true
+    initial_value: 4
+
+  - platform: template
+    name: "t_cool_max"
+    id: n_t_cool_max
+    icon: mdi:timer-outline
+    entity_category: config
+    unit_of_measurement: "min"
+    min_value: 60
+    max_value: 300
+    step: 1
+    restore_value: true
+    optimistic: true
+    initial_value: 180
+
+  - platform: template
+    name: "t_pump"
+    id: n_t_pump
+    icon: mdi:timer
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 20
+    max_value: 180
+    step: 10
+    restore_value: true
+    optimistic: true
+    initial_value: 60
+
+  - platform: template
+    name: "t_hot_max"
+    id: n_t_hot_max
+    icon: mdi:thermometer-alert
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 40
+    max_value: 90
+    step: 1
+    restore_value: true
+    optimistic: true
+    initial_value: 70
+
+  - platform: template
+    name: "t_light_hold"
+    id: n_t_light_hold
+    icon: mdi:timer-outline
+    entity_category: config
+    unit_of_measurement: "min"
+    min_value: 1
+    max_value: 120
+    step: 1
+    restore_value: true
+    optimistic: true
+    initial_value: 20
+
+  - platform: template
+    name: "fan_cold_pwm"
+    id: n_fan_cold_pwm
+    icon: mdi:fan-speed-1
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    restore_value: true
+    optimistic: true
+    initial_value: 27
+
+  - platform: template
+    name: "delta_t_ice"
+    id: n_delta_t_ice
+    icon: mdi:snowflake-alert
+    entity_category: config
+    unit_of_measurement: "K"
+    min_value: 0
+    max_value: 10
+    step: 0.5
+    restore_value: true
+    optimistic: true
+    initial_value: 3
+
+  - platform: template
+    name: "t_ice_min"
+    id: n_t_ice_min
+    icon: mdi:timer-outline
+    entity_category: config
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 60
+    step: 1
+    restore_value: true
+    optimistic: true
+    initial_value: 5
+
+  - platform: ld2412
+    timeout:
+      name: "Radar Presence Timeout"
+    min_distance_gate:
+      name: "Radar Minimum Distance Gate"
+    max_distance_gate:
+      name: "Radar Maximum Distance Gate"
+    light_threshold:
+      name: "Radar Light Threshold"
+
+button:
+  - platform: template
+    name: "force_defrost"
+    icon: mdi:snowflake-melt
+    entity_category: config
+    on_press:
+      - lambda: id(force_defrost) = true;
+      - script.execute: apply_outputs
+
+  - platform: template
+    name: "force_dry"
+    icon: mdi:weather-windy
+    entity_category: config
+    on_press:
+      - lambda: id(force_dry) = true;
+      - script.execute: apply_outputs
+
+  - platform: template
+    name: "reset_fault"
+    icon: mdi:alert-remove
+    entity_category: config
+    on_press:
+      - lambda: id(fault_latched) = false;
+      - script.execute: apply_outputs
+  - platform: ld2412
+    factory_reset:
+      name: "Radar Factory Reset"
+    restart:
+      name: "Radar Restart"
+    query_params:
+      name: "Radar Query Params"
+    start_dynamic_background_correction:
+      name: "Radar Start Dynamic Background Correction"
+
+
+sensor:
+  - platform: sht3xd
+    address: 0x44
+    update_interval: 60s
+    temperature:
+      name: "temp_sht"
+      id: s_temp_sht
+      device_class: temperature
+      state_class: measurement
+      icon: mdi:thermometer
+    humidity:
+      name: "rh"
+      id: s_rh
+      device_class: humidity
+      state_class: measurement
+      icon: mdi:water-percent
+
+  - platform: absolute_humidity
+    name: "absolute_humidity"
+    icon: mdi:water
+    state_class: measurement
+    temperature: s_temp_sht
+    humidity: s_rh
+
+  - platform: dallas_temp
+    name: "temp_cold"
+    id: s_temp_cold
+    icon: mdi:snowflake
+    device_class: temperature
+    state_class: measurement
+    address: 0x1c000005ad1bfc28
+    update_interval: 30s
+
+  - platform: dallas_temp
+    name: "temp_hot"
+    id: s_temp_hot
+    icon: mdi:fire
+    device_class: temperature
+    state_class: measurement
+    address: 0x803c01d60765a928
+    update_interval: 60s
+
+  # - platform: dallas_temp
+  #   name: "temp_add1"
+  #   id: s_temp_add1
+  #   icon: mdi:thermometer
+  #   device_class: temperature
+  #   state_class: measurement
+  #   address: 0x803c01d60765a928
+  #   update_interval: 5s
+
+  # - platform: dallas_temp
+  #   name: "temp_add2"
+  #   id: s_temp_add2
+  #   icon: mdi:thermometer
+  #   device_class: temperature
+  #   state_class: measurement
+  #   address: 0x803c01d60765a928
+  #   update_interval: 5s
+
+  - platform: template
+    name: "peltier_pwm"
+    icon: mdi:percent
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      return id(peltier_level) * 100.0f;
+
+  - platform: ld2412
+    moving_distance:
+      name: "Radar Moving Distance"
+      icon: mdi:ruler
+    still_distance:
+      name: "Radar Still Distance"
+      icon: mdi:ruler
+    moving_energy:
+      name: "Radar Moving Energy"
+      icon: mdi:flash
+    still_energy:
+      name: "Radar Still Energy"
+      icon: mdi:flash
+    detection_distance:
+      name: "Radar Detection Distance"
+      icon: mdi:ruler
+
+binary_sensor:
+  - platform: gpio
+    name: "door_open"
+    id: bs_door_open
+    device_class: door
+    icon: mdi:door-open
+    pin:
+      pcf8574: pcf_in_1_8
+      number: 0
+      mode: INPUT
+      inverted: ${door_inverted}
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+
+
+  - platform: ld2412
+    has_target:
+      name: "Radar Presence"
+      id: bs_radar_presence
+      device_class: occupancy
+      icon: mdi:motion-sensor
+    dynamic_background_correction_status:
+      name: "Radar Dynamic Background Correction Status"
+    has_moving_target:
+      name: "Radar Moving Target"
+
+  - platform: template
+    name: "schrank_fault"
+    device_class: problem
+    icon: mdi:alert-circle
+    lambda: |-
+      return id(fault_latched);
+
+text_sensor:
+  - platform: template
+    name: "state_machine_state"
+    icon: mdi:state-machine
+    lambda: |-
+      if (id(fault_latched)) return std::string("FAULT");
+      switch (id(sm_state)) {
+        case 0: return std::string("IDLE");
+        case 1: return std::string("COOLING");
+        case 2: return std::string("DEFROST");
+        case 3: return std::string("PUMP");
+        default: return std::string("UNKNOWN");
+      }
+    update_interval: 60s
+
+script:
+  - id: apply_outputs
+    mode: restart
+    then:
+      - lambda: |-
+          const bool enable = id(schrank_peltier_enable).state;
+          const bool door_open = id(bs_door_open).state;
+          const bool presence = id(bs_radar_presence).state;
+
+          const bool rh_ok = !isnan(id(s_rh).state);
+          const bool tc_ok = !isnan(id(s_temp_cold).state);
+          const bool th_ok = !isnan(id(s_temp_hot).state);
+
+          // Hot-side protection
+          if (enable && th_ok && (id(s_temp_hot).state > id(n_t_hot_max).state)) {
+            id(fault_latched) = true;
+            id(sm_state) = 0;
+            id(sm_timer_s) = 0;
+            id(force_dry) = false;
+            id(force_defrost) = false;
+          }
+
+          // Light auto request
+          bool auto_light_req = false;
+          if (id(schrank_light_auto).state) {
+            if (presence) auto_light_req = true;
+            if (${door_forces_light} && door_open) auto_light_req = true;
+            if (id(light_hold_s) > 0) auto_light_req = true;
+          }
+
+          // Targets
+          bool want_hot_fan = false;
+          float want_cold_fan = 0.0f;
+          float want_peltier = 0.0f;
+          bool want_pump = false;
+          bool want_aux_fan = false;
+
+          if (id(fault_latched) || !enable) {
+            want_peltier = 0.0f;
+            want_cold_fan = 0.0f;
+            want_hot_fan = id(fault_latched) ? true : id(man_fan_hot);
+            want_pump = id(man_pump);
+            want_aux_fan = id(man_fan_aux);
+          } else {
+            const int st = id(sm_state);
+
+            want_hot_fan = (st == 1) || (st == 2) || (id(hot_fan_postrun_s) > 0) || id(man_fan_hot);
+            want_aux_fan = (st == 1) || id(man_fan_aux);
+
+            if (st == 3) {
+              want_pump = (id(sm_timer_s) < (uint32_t) id(n_t_pump).state);
+            }
+            want_pump = want_pump || id(man_pump);
+
+            if (st == 1) {
+              want_cold_fan = id(n_fan_cold_pwm).state / 100.0f;
+            }
+            if (id(man_fan_cold)) want_cold_fan = 1.0f;
+
+            if (st == 1) {
+              if (${pause_drying_on_door_open} && door_open) {
+                want_peltier = 0.0f;
+              } else if (tc_ok) {
+                const float t = id(s_temp_cold).state;
+                const float sp = id(n_t_cold_soll).state;
+                const float err = t - sp;
+
+                float u = id(peltier_level);
+                if (err > 2.0f) u = 1.0f;
+                else if (err > 1.0f) u = 0.7f;
+                else if (err > 0.3f) u = 0.4f;
+                else if (err < -0.5f) u = 0.0f;
+
+                if (u < 0.0f) u = 0.0f;
+                if (u > 1.0f) u = 1.0f;
+                want_peltier = u;
+              } else {
+                want_peltier = 0.0f;
+              }
+            } else {
+              want_peltier = 0.0f;
+            }
+          }
+
+          // Tür offen => nur Zusatzlüfter (Y06) aus, Rest läuft weiter
+          if (door_open) {
+            want_aux_fan = false;
+          }
+
+          id(peltier_level) = want_peltier;
+          id(fan_cold_level) = want_cold_fan;
+
+          id(out_peltier).set_level(want_peltier);
+          id(out_fan_cold).set_level(want_cold_fan);
+
+          if (want_hot_fan) id(sw_fan_hot_phys).turn_on();
+          else id(sw_fan_hot_phys).turn_off();
+
+          if (want_pump) id(sw_pump_phys).turn_on();
+          else id(sw_pump_phys).turn_off();
+
+          const bool want_light = id(man_light) || auto_light_req;
+          if (want_light) id(sw_light_phys).turn_on();
+          else id(sw_light_phys).turn_off();
+
+          if (want_aux_fan) id(sw_fan_aux_phys).turn_on();
+          else id(sw_fan_aux_phys).turn_off();
+
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          const bool enable = id(schrank_peltier_enable).state;
+          const bool door_open = id(bs_door_open).state;
+          const bool rh_ok = !isnan(id(s_rh).state);
+          const bool tc_ok = !isnan(id(s_temp_cold).state);
+
+          // Light hold timer
+          if (id(schrank_light_auto).state) {
+            if (id(bs_radar_presence).state || (${door_forces_light} && door_open)) {
+              id(light_hold_s) = (uint32_t) (id(n_t_light_hold).state * 60.0f);
+            } else {
+              if (id(light_hold_s) > 0) id(light_hold_s)--;
+            }
+          } else {
+            id(light_hold_s) = 0;
+          }
+
+          // Hot fan postrun
+          if (id(peltier_level) > 0.01f) id(hot_fan_postrun_s) = 300;
+          else if (id(hot_fan_postrun_s) > 0) id(hot_fan_postrun_s)--;
+
+          if (!enable || id(fault_latched)) {
+            id(sm_state) = 0;
+            id(sm_timer_s) = 0;
+            id(ice_timer_s) = 0;
+            id(force_defrost) = false;
+            return;
+          }
+
+          if (!rh_ok) {
+            id(sm_state) = 0;
+            id(sm_timer_s) = 0;
+            id(ice_timer_s) = 0;
+            return;
+          }
+
+          id(sm_timer_s)++;
+
+          const float rh = id(s_rh).state;
+          const float rh_start = id(n_rh_start).state;
+          const float rh_stop  = id(n_rh_stop).state;
+          const uint32_t t_cool_max_s = (uint32_t) (id(n_t_cool_max).state * 60.0f);
+
+          // Ice heuristic
+          bool ice_trigger = false;
+          const float dT_ice = id(n_delta_t_ice).state;
+          const uint32_t t_ice_min_s = (uint32_t) (id(n_t_ice_min).state * 60.0f);
+          if (tc_ok && dT_ice > 0.1f && t_ice_min_s > 0) {
+            const float t = id(s_temp_cold).state;
+            const float sp = id(n_t_cold_soll).state;
+            if (t < (sp - dT_ice)) {
+              if (id(ice_timer_s) < 0xFFFFFFFF) id(ice_timer_s)++;
+              if (id(ice_timer_s) >= t_ice_min_s) ice_trigger = true;
+            } else {
+              id(ice_timer_s) = 0;
+            }
+          } else {
+            id(ice_timer_s) = 0;
+          }
+
+          const float t_defrost_end = id(n_t_defrost_end).state;
+          const bool defrost_done = tc_ok ? (id(s_temp_cold).state > t_defrost_end) : false;
+
+          switch (id(sm_state)) {
+            case 0: { // IDLE
+              id(sm_timer_s) = 0;
+              id(ice_timer_s) = 0;
+              if (id(force_dry) || (rh > rh_start)) {
+                id(sm_state) = 1;
+                id(sm_timer_s) = 0;
+              }
+              break;
+            }
+
+            case 1: { // COOLING
+              if (!id(force_dry) && (rh <= rh_stop)) {
+                id(sm_state) = 0;
+                id(sm_timer_s) = 0;
+                id(force_defrost) = false;
+                break;
+              }
+
+              if (id(force_defrost) || (id(sm_timer_s) >= t_cool_max_s) || ice_trigger) {
+                id(sm_state) = 2;
+                id(sm_timer_s) = 0;
+                id(force_defrost) = false;
+                id(ice_timer_s) = 0;
+              }
+              break;
+            }
+
+            case 2: { // DEFROST
+              // Hard timeout 30min
+              if (id(sm_timer_s) > 1800) {
+                id(sm_state) = 3;
+                id(sm_timer_s) = 0;
+                break;
+              }
+              if (defrost_done) {
+                id(sm_state) = 3;
+                id(sm_timer_s) = 0;
+              }
+              break;
+            }
+
+            case 3: { // PUMP
+              const uint32_t t_pump_s = (uint32_t) id(n_t_pump).state;
+              if (id(sm_timer_s) >= t_pump_s) {
+                if (!id(force_dry) && (rh <= rh_stop)) id(sm_state) = 0;
+                else id(sm_state) = 1;
+                id(sm_timer_s) = 0;
+              }
+              break;
+            }
+
+            default:
+              id(sm_state) = 0;
+              id(sm_timer_s) = 0;
+              break;
+          }
+
+      - script.execute: apply_outputs
