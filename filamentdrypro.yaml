@@ -10,7 +10,7 @@
 #   switch.<devicename>_pump           : Manuell Pumpe (Override)
 #   switch.<devicename>_fan_aux        : Manuell Zusatzlüfter (Override)
 #   switch.<devicename>_light          : Manuell Innenlicht
-#   switch.<devicename>_light_auto     : Auto-Licht per Radar/Tür (Hold-Timer)
+#   switch.<devicename>_light_auto     : Auto-Licht per Präsenz/Tür (Hold-Timer)
 #
 # PARAMETER (number.*) [entity_category: config]:
 #   number.<devicename>_rh_start       : Start Entfeuchtung [% rF]
@@ -20,11 +20,11 @@
 #   number.<devicename>_t_cool_max     : Max. COOLING Dauer [min] -> dann DEFROST
 #   number.<devicename>_t_pump         : Pumpdauer im PUMP-State [s]
 #   number.<devicename>_t_hot_max      : Übertemp Heißseite -> Fault [°C]
-#   number.<devicename>_t_light_hold   : Licht-Haltezeit nach Radar [min]
+#   number.<devicename>_t_light_hold   : Licht-Haltezeit nach Präsenz [min]
 #   number.<devicename>_fan_cold_pwm   : Basis PWM Kaltlüfter [%] (hier als Level genutzt)
 #   number.<devicename>_delta_t_ice    : Eisheuristik ΔT [K]
 #   number.<devicename>_t_ice_min      : Eisheuristik Mindestzeit [min]
-#   (optional) diverse Radar/LD2412 Parameter
+#   (optional) Präsenz-Quelle kommt aus Home Assistant
 #
 # SENSOREN (sensor.*):
 #   sensor.<devicename>_rh             : Innen rF (SHT45)
@@ -33,18 +33,16 @@
 #   sensor.<devicename>_temp_cold      : DS18B20 Kaltplatte
 #   sensor.<devicename>_temp_hot       : DS18B20 Heißseite/Heatsink
 #   sensor.<devicename>_peltier_pwm    : aktuell berechneter Peltier-Duty [%]
-#   (optional) diverse Radar/LD2412 Telemetrie-Sensoren
 #
 # BINÄRE SENSOREN (binary_sensor.*):
 #   binary_sensor.<devicename>_door_open      : Tür offen (X01)
-#   binary_sensor.<devicename>_radar_presence : Radar Präsenz (LD2412)
+#   binary_sensor.<devicename>_presence : Präsenz (aus Home Assistant)
 #   binary_sensor.<devicename>_schrank_fault  : latched fault (T_hot > max)
 #
 # BUTTONS (button.*) [entity_category: config]:
 #   button.<devicename>_force_defrost
 #   button.<devicename>_force_dry
 #   button.<devicename>_reset_fault
-#   (optional) diverse Radar/LD2412 Buttons
 #
 # Anschluss-/Verdrahtungsübersicht (KC868-A16, REV:1.6)
 # --------------------------------------------------------------------------
@@ -57,9 +55,9 @@
 # Türkontakt:
 #   X01 (PCF8574 @0x22, Pin0) -> Reedkontakt (dry contact)
 #
-# Radar LD2412:
-#   ESP32 TX GPIO15 -> LD2412 RX -> 433 Stecker P7 Pin3 (GND | 3V3 | GPIO15 | ...)
-#   ESP32 RX GPIO33 -> LD2412 TX -> HT2 / GPIO33
+# Präsenz:
+#   Wird aus Home Assistant übernommen:
+#   binary_sensor.bewegung_filamentschrank_0xa4c138033cf71bdf_occupancy
 #
 # MOSFET-Ausgänge (über PCF8574 Outputs):
 #   Y09 -> Peltier-Leistungsstufe (externes MOSFET-Gate/Enable)   [PCF @0x25 Pin0]
@@ -94,7 +92,7 @@ substitutions:
 esphome:
   name: ${devicename}
   friendly_name: ${friendly_name}
-  comment: "Trockenschrank: Entfeuchtung + Radar-Licht (State-Machine IDLE/COOLING/DEFROST/PUMP)"
+  comment: "Trockenschrank: Entfeuchtung + Präsenz-Licht (HA) (State-Machine IDLE/COOLING/DEFROST/PUMP)"
 
   on_boot:
     priority: -100
@@ -166,17 +164,6 @@ one_wire:
   - platform: gpio
     pin: GPIO32
 
-uart:
-  - id: uart_ld2412
-    tx_pin: GPIO15
-    rx_pin: GPIO33
-    baud_rate: 115200
-    data_bits: 8
-    parity: NONE
-    stop_bits: 1
-
-ld2412:
-  uart_id: uart_ld2412
 
 globals:
   - id: sm_state
@@ -536,16 +523,6 @@ number:
     optimistic: true
     initial_value: 5
 
-  - platform: ld2412
-    timeout:
-      name: "Radar Presence Timeout"
-    min_distance_gate:
-      name: "Radar Minimum Distance Gate"
-    max_distance_gate:
-      name: "Radar Maximum Distance Gate"
-    light_threshold:
-      name: "Radar Light Threshold"
-
 button:
   - platform: template
     name: "force_defrost"
@@ -570,17 +547,6 @@ button:
     on_press:
       - lambda: id(fault_latched) = false;
       - script.execute: apply_outputs
-  - platform: ld2412
-    factory_reset:
-      name: "Radar Factory Reset"
-    restart:
-      name: "Radar Restart"
-    query_params:
-      name: "Radar Query Params"
-    start_dynamic_background_correction:
-      name: "Radar Start Dynamic Background Correction"
-
-
 sensor:
   - platform: sht4x
     address: 0x44
@@ -651,24 +617,12 @@ sensor:
     lambda: |-
       return id(peltier_level) * 100.0f;
 
-  - platform: ld2412
-    moving_distance:
-      name: "Radar Moving Distance"
-      icon: mdi:ruler
-    still_distance:
-      name: "Radar Still Distance"
-      icon: mdi:ruler
-    moving_energy:
-      name: "Radar Moving Energy"
-      icon: mdi:flash
-    still_energy:
-      name: "Radar Still Energy"
-      icon: mdi:flash
-    detection_distance:
-      name: "Radar Detection Distance"
-      icon: mdi:ruler
-
 binary_sensor:
+  - platform: homeassistant
+    id: bs_presence
+    entity_id: binary_sensor.bewegung_filamentschrank_0xa4c138033cf71bdf_occupancy
+    internal: true
+
   - platform: gpio
     name: "door_open"
     id: bs_door_open
@@ -682,19 +636,6 @@ binary_sensor:
     filters:
       - delayed_on: 30ms
       - delayed_off: 30ms
-
-
-  - platform: ld2412
-    has_target:
-      name: "Radar Presence"
-      id: bs_radar_presence
-      device_class: occupancy
-      icon: mdi:motion-sensor
-    dynamic_background_correction_status:
-      name: "Radar Dynamic Background Correction Status"
-    has_moving_target:
-      name: "Radar Moving Target"
-
   - platform: template
     name: "schrank_fault"
     device_class: problem
@@ -724,7 +665,7 @@ script:
       - lambda: |-
           const bool enable = id(schrank_peltier_enable).state;
           const bool door_open = id(bs_door_open).state;
-          const bool presence = id(bs_radar_presence).state;
+          const bool presence = id(bs_presence).state;
 
           const bool rh_ok = !isnan(id(s_rh).state);
           const bool tc_ok = !isnan(id(s_temp_cold).state);
@@ -860,7 +801,7 @@ interval:
 
           // Light hold timer
           if (id(schrank_light_auto).state) {
-            if (id(bs_radar_presence).state || (${door_forces_light} && door_open)) {
+            if (id(bs_presence).state || (${door_forces_light} && door_open)) {
               id(light_hold_s) = (uint32_t) (id(n_t_light_hold).state * 60.0f);
             } else {
               if (id(light_hold_s) > 0) id(light_hold_s)--;

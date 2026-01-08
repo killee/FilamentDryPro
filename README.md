@@ -29,7 +29,7 @@ Das Projekt basiert auf einem IKEA Billy mit Vitrinentüren und einem Entfeuchte
 - Kaltseitengebläse / 5015
 - Peristaltikpumpe 12 V
 - ESP32 / KC868-A16
-- Sensorik: SHT3x (besser SHT45), mehrere DS18B20, LD2412, Türkontakt
+- Sensorik: SHT45 (statt SHT3x – meine günstigen SHT3x von Amazon waren bei der Feuchte unzuverlässig), mehrere DS18B20, Türkontakt, Präsenz kommt aus Home Assistant
 - Diverse Druckteile
 
 ---
@@ -220,10 +220,10 @@ Die Steuerung läuft auf einem **ESP32** (Board: `esp32dev`) und ist als **ESPHo
 
 ### Sensorik
 
-- **SHT3x** am I²C (Temp + rF)
+- **SHT45** am I²C (Temp + rF)
 - **Absolute Feuchte** als berechneter Sensor
 - **DS18B20** am 1‑Wire Bus (u.a. Kaltplatte + Heißseite)
-- **LD2412 Radar** über UART (Präsenz, Telemetrie)
+- **Präsenz** kommt aus Home Assistant (Binary Sensor)
 - **Türkontakt** über PCF8574 Input
 
 ### Aktoren
@@ -254,7 +254,7 @@ Wichtige Punkte:
 - Pumpdauer im Pump-State (`t_pump`)
 - Übertemperatur-Schutz Heißseite (`t_hot_max`) → Fault (gelatcht)
 - Türlogik: State Machine läuft weiter, aber bei offener Tür wird **nur** der Zusatzlüfter sofort aus gemacht
-- Auto-Licht: Radar/Tür + Hold-Timer (`t_light_hold`)
+- Auto-Licht: Präsenz/Tür + Hold-Timer (`t_light_hold`)
 
 ### Home Assistant Entities
 
