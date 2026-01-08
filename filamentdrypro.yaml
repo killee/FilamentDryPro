@@ -27,8 +27,8 @@
 #   (optional) diverse Radar/LD2412 Parameter
 #
 # SENSOREN (sensor.*):
-#   sensor.<devicename>_rh             : Innen rF (SHT3x)
-#   sensor.<devicename>_temp_sht       : Innen Temp (SHT3x)
+#   sensor.<devicename>_rh             : Innen rF (SHT45)
+#   sensor.<devicename>_temp_sht       : Innen Temp (SHT45)
 #   sensor.<devicename>_absolute_humidity : Absolute Feuchte (aus Temp+RH)
 #   sensor.<devicename>_temp_cold      : DS18B20 Kaltplatte
 #   sensor.<devicename>_temp_hot       : DS18B20 Heißseite/Heatsink
@@ -49,7 +49,7 @@
 # Anschluss-/Verdrahtungsübersicht (KC868-A16, REV:1.6)
 # --------------------------------------------------------------------------
 # I2C Bus:
-#   GPIO4 = SDA, GPIO5 = SCL -> SHT3x + PCF8574 Expander, JST Stecker beschriftet
+#   GPIO4 = SDA, GPIO5 = SCL -> SHT45 + PCF8574 Expander, JST Stecker beschriftet
 #
 # DS18B20 (1-Wire Bus):
 #   HT1 / GPIO32 -> alle DS18B20 parallel (T_cold, T_hot, T_add1, T_add2)
@@ -109,6 +109,9 @@ esphome:
           id(fault_latched) = false;
           id(force_defrost) = false;
           id(force_dry) = false;
+          id(stop_after_pump) = false;
+          id(periodic_pump_elapsed_s) = 0;
+          id(periodic_pump_left_s) = 0;
           id(peltier_level) = 0.0f;
           id(fan_cold_level) = 0.0f;
           id(man_fan_cold) = false;
@@ -221,6 +224,20 @@ globals:
   - id: man_light
     type: bool
     initial_value: "false"
+
+  # COOLING darf auch bei Zielfeuchte nicht direkt in IDLE enden.
+  # Stattdessen wird DEFROST + PUMP einmal durchlaufen.
+  - id: stop_after_pump
+    type: bool
+    initial_value: "false"
+
+  # Wenn die Kaltseite nicht unter -1°C kommt: alle 15min für 10s pumpen.
+  - id: periodic_pump_elapsed_s
+    type: uint32_t
+    initial_value: "0"
+  - id: periodic_pump_left_s
+    type: uint32_t
+    initial_value: "0"
 
 output:
   # Y09 -> Peltier (PCF 0x25, Pin0)
@@ -565,7 +582,7 @@ button:
 
 
 sensor:
-  - platform: sht3xd
+  - platform: sht4x
     address: 0x44
     update_interval: 60s
     temperature:
@@ -754,6 +771,11 @@ script:
             }
             want_pump = want_pump || id(man_pump);
 
+            // Periodisches Abpumpen, wenn die Kaltseite nicht unter -1°C kommt
+            if (id(periodic_pump_left_s) > 0) {
+              want_pump = true;
+            }
+
             if (st == 1) {
               want_cold_fan = id(n_fan_cold_pwm).state / 100.0f;
             }
@@ -817,6 +839,25 @@ interval:
           const bool rh_ok = !isnan(id(s_rh).state);
           const bool tc_ok = !isnan(id(s_temp_cold).state);
 
+          // Periodisches Abpumpen: wenn Kaltseite nicht unter -1°C kommt
+          // -> alle 15min für 10s pumpen (nur während COOLING).
+          const bool periodic_pump_cond = enable && !id(fault_latched) && (id(sm_state) == 1) && tc_ok && (id(s_temp_cold).state > -1.0f);
+          if (!periodic_pump_cond) {
+            id(periodic_pump_elapsed_s) = 0;
+            id(periodic_pump_left_s) = 0;
+          } else {
+            if (id(periodic_pump_left_s) > 0) {
+              if (id(periodic_pump_left_s) <= 10) id(periodic_pump_left_s) = 0;
+              else id(periodic_pump_left_s) -= 10;
+            } else {
+              if (id(periodic_pump_elapsed_s) < 0xFFFFFFFF - 10) id(periodic_pump_elapsed_s) += 10;
+              if (id(periodic_pump_elapsed_s) >= 900) {
+                id(periodic_pump_left_s) = 10;
+                id(periodic_pump_elapsed_s) = 0;
+              }
+            }
+          }
+
           // Light hold timer
           if (id(schrank_light_auto).state) {
             if (id(bs_radar_presence).state || (${door_forces_light} && door_open)) {
@@ -837,6 +878,7 @@ interval:
             id(sm_timer_s) = 0;
             id(ice_timer_s) = 0;
             id(force_defrost) = false;
+            id(stop_after_pump) = false;
             return;
           }
 
@@ -879,6 +921,7 @@ interval:
               id(sm_timer_s) = 0;
               id(ice_timer_s) = 0;
               if (id(force_dry) || (rh > rh_start)) {
+                id(stop_after_pump) = false;
                 id(sm_state) = 1;
                 id(sm_timer_s) = 0;
               }
@@ -886,8 +929,10 @@ interval:
             }
 
             case 1: { // COOLING
+              // Auch wenn Zielfeuchte erreicht ist: erst DEFROST + PUMP durchlaufen.
               if (!id(force_dry) && (rh <= rh_stop)) {
-                id(sm_state) = 0;
+                id(stop_after_pump) = true;
+                id(sm_state) = 2;
                 id(sm_timer_s) = 0;
                 id(force_defrost) = false;
                 break;
@@ -919,8 +964,13 @@ interval:
             case 3: { // PUMP
               const uint32_t t_pump_s = (uint32_t) id(n_t_pump).state;
               if (id(sm_timer_s) >= t_pump_s) {
-                if (!id(force_dry) && (rh <= rh_stop)) id(sm_state) = 0;
-                else id(sm_state) = 1;
+                if (id(stop_after_pump)) {
+                  id(sm_state) = 0;
+                  id(stop_after_pump) = false;
+                } else {
+                  if (!id(force_dry) && (rh <= rh_stop)) id(sm_state) = 0;
+                  else id(sm_state) = 1;
+                }
                 id(sm_timer_s) = 0;
               }
               break;
